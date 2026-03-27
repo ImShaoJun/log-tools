@@ -29,13 +29,13 @@ go build -o log-tools .
 ## 运行
 
 ```bash
-./log-tools --log-dir /var/log/myapp --addr :8080
+./log-tools --log-dir /var/log/myapp --addr :9999
 ```
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--log-dir` | （必填）| 要检索的日志目录路径 |
-| `--addr` | `:8080` | 监听地址 |
+| `--addr` | `:9999` | 监听地址 |
 
 ---
 
@@ -59,7 +59,7 @@ go build -o log-tools .
 |------|------|------|------|
 | `keyword` | string | ✅ | 搜索关键词（传递给 grep/zgrep 的 PATTERN） |
 | `tool` | string | | `"grep"`（默认）或 `"zgrep"` |
-| `file_pattern` | string | | 相对于日志目录的文件名 glob（默认 `*`，递归搜索整个目录） |
+| `file_pattern` | string | | 相对于日志目录的文件名 glob（支持子目录，但不能以 `..` 或 `/` 开头，默认 `*`） |
 | `extra_flags` | []string | | 附加安全标志，见下方白名单 |
 
 **允许的 `extra_flags`：**
@@ -84,17 +84,17 @@ go build -o log-tools .
 
 ```bash
 # 在所有日志文件中搜索 ERROR
-curl -s -X POST http://localhost:8080/search \
+curl -s -X POST http://localhost:9999/search \
   -H "Content-Type: application/json" \
   -d '{"keyword":"ERROR","tool":"grep"}'
 
 # 大小写不敏感搜索，仅限 app.log
-curl -s -X POST http://localhost:8080/search \
+curl -s -X POST http://localhost:9999/search \
   -H "Content-Type: application/json" \
   -d '{"keyword":"error","tool":"grep","file_pattern":"app.log","extra_flags":["-i"]}'
 
 # 在压缩日志中搜索（需要 zgrep）
-curl -s -X POST http://localhost:8080/search \
+curl -s -X POST http://localhost:9999/search \
   -H "Content-Type: application/json" \
   -d '{"keyword":"TIMEOUT","tool":"zgrep","file_pattern":"*.gz"}'
 ```
