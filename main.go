@@ -143,14 +143,34 @@ func (s *server) runSearch(req SearchRequest) (*SearchResponse, int, error) {
 	if filePattern == "" {
 		filePattern = "*"
 	}
-	cleanPattern := filepath.Base(filePattern)
+
+	if strings.HasPrefix(filePattern, "..") || strings.HasPrefix(filePattern, "/") {
+		return nil, http.StatusBadRequest, errors.New("invalid file pattern: cannot start with '..' or '/'")
+	}
+
+	// Resolve absolute path and ensure it's within logDir.
+	fullPath := filepath.Join(s.logDir, filePattern)
+	cleanPath := filepath.Clean(fullPath)
+
+	absLogDir, err := filepath.Abs(s.logDir)
+	if err != nil {
+		return nil, http.StatusInternalServerError, fmt.Errorf("failed to get absolute log directory: %v", err)
+	}
+	absCleanPath, err := filepath.Abs(cleanPath)
+	if err != nil {
+		return nil, http.StatusInternalServerError, fmt.Errorf("failed to get absolute search path: %v", err)
+	}
+
+	if !strings.HasPrefix(absCleanPath, absLogDir) {
+		return nil, http.StatusBadRequest, errors.New("invalid file pattern: outside of log directory")
+	}
 
 	var searchTargets []string
-	if cleanPattern == "*" {
+	if filePattern == "*" {
 		// Search the whole log directory recursively.
 		searchTargets = []string{s.logDir}
 	} else {
-		matches, err := filepath.Glob(filepath.Join(s.logDir, cleanPattern))
+		matches, err := filepath.Glob(cleanPath)
 		if err != nil {
 			return nil, http.StatusBadRequest, fmt.Errorf("invalid file pattern: %v", err)
 		}
@@ -170,13 +190,19 @@ func (s *server) runSearch(req SearchRequest) (*SearchResponse, int, error) {
 	args = append(args, req.Keyword)
 	args = append(args, searchTargets...)
 
-	cmd := exec.Command(req.Tool, args...) //nolint:gosec // tool is allow-listed; args are not shell-expanded
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, req.Tool, args...) //nolint:gosec // tool is allow-listed; args are not shell-expanded
 	output, err := cmd.Output()
 
 	// Build human-readable command string for the response.
 	cmdStr := req.Tool + " " + strings.Join(args, " ")
 
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, http.StatusGatewayTimeout, errors.New("search command timed out")
+		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			// Exit code 1 from grep means "no matches found" – not an error.
@@ -213,7 +239,7 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 
 func main() {
 	logDir := flag.String("log-dir", "", "path to the log directory to search (required)")
-	addr := flag.String("addr", ":8080", "address to listen on (default :8080)")
+	addr := flag.String("addr", ":9999", "address to listen on (default :9999)")
 	flag.Parse()
 
 	if *logDir == "" {
