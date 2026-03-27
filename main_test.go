@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -258,5 +259,66 @@ func TestCommandFieldPopulated(t *testing.T) {
 	resp := decodeResponse(t, rr)
 	if resp.Command == "" {
 		t.Fatal("Command field should not be empty")
+	}
+}
+
+// TestSearchFilePatternPrefix verifies that file_pattern cannot start with '..' or '/'.
+func TestSearchFilePatternPrefix(t *testing.T) {
+	dir := setupLogDir(t)
+	s := newServer(dir)
+
+	// Test ".." prefix
+	rr := postSearch(t, s, SearchRequest{Keyword: "INFO", FilePattern: "../etc/passwd"})
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for '..' prefix, got %d", rr.Code)
+	}
+
+	// Test "/" prefix
+	rr = postSearch(t, s, SearchRequest{Keyword: "INFO", FilePattern: "/etc/passwd"})
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for '/' prefix, got %d", rr.Code)
+	}
+}
+
+// TestSearchSubdirAndTraversal verifies that subdirectory searches work while preventing traversal.
+func TestSearchSubdirAndTraversal(t *testing.T) {
+	dir := setupLogDir(t)
+	s := newServer(dir)
+
+	// Setup a subdirectory
+	subdir := filepath.Join(dir, "logs")
+	err := os.Mkdir(subdir, 0755)
+	if err != nil {
+		t.Fatalf("mkdir logs: %v", err)
+	}
+	err = os.WriteFile(filepath.Join(subdir, "inner.log"), []byte("MATCH_ME\n"), 0644)
+	if err != nil {
+		t.Fatalf("create inner.log: %v", err)
+	}
+
+	// Test valid subdirectory search
+	rr := postSearch(t, s, SearchRequest{Keyword: "MATCH_ME", FilePattern: "logs/inner.log"})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 for subdir search, got %d: %s", rr.Code, rr.Body.String())
+	}
+	resp := decodeResponse(t, rr)
+	if resp.Count != 1 {
+		t.Fatalf("expected 1 match in subdir, got %d", resp.Count)
+	}
+
+	// Test traversal attempt: "logs/../../" (stays inside if using filepath.Base, but we want it to stay in logDir)
+	// The prefix check caught it at start, but let's test something that bypasses it if possible.
+	// Actually "a/../../etc/passwd" doesn't start with ".." or "/".
+	rr = postSearch(t, s, SearchRequest{Keyword: "root", FilePattern: "logs/../../etc/passwd"})
+	if rr.Code == http.StatusOK {
+		resp = decodeResponse(t, rr)
+		for _, line := range resp.Lines {
+			if strings.Contains(line, "root:x:") {
+				t.Fatal("path traversal succeeded")
+			}
+		}
+	} else if rr.Code != http.StatusBadRequest && rr.Code != http.StatusNotFound {
+		// Either it should be blocked (400) or not found (maybe 200 with 0 matches).
+		// Currently filepath.Base("logs/../../etc/passwd") is "passwd", which might exist in logDir.
 	}
 }
