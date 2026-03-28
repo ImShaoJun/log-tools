@@ -23,8 +23,11 @@ type SearchRequest struct {
 	Keyword string `json:"keyword"`
 	// Tool selects the underlying command: "grep" or "zgrep".
 	Tool string `json:"tool"`
-	// FilePattern is an optional glob relative to the log directory (default: "*").
-	FilePattern string `json:"file_pattern"`
+	// TimeRange is a relative time duration string (e.g., "1h", "30m", "1d").
+	// If set, it's used with the server's --log-name-format to find log files.
+	TimeRange string `json:"time_range"`
+	// MaxLines limits the number of matching lines returned (maps to grep -m).
+	MaxLines int `json:"max_lines"`
 	// ExtraFlags are optional additional flags forwarded to grep/zgrep (e.g. ["-i", "-n"]).
 	// Only the safe allow-listed flags are accepted.
 	ExtraFlags []string `json:"extra_flags"`
@@ -68,12 +71,16 @@ var allowedFlags = map[string]struct{}{
 
 // server holds the application-wide configuration.
 type server struct {
-	logDir string
-	mux    *http.ServeMux
+	logDir        string
+	logNameFormat string
+	mux           *http.ServeMux
 }
 
-func newServer(logDir string) *server {
-	s := &server{logDir: logDir}
+func newServer(logDir, logNameFormat string) *server {
+	s := &server{
+		logDir:        logDir,
+		logNameFormat: logNameFormat,
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/search", s.handleSearch)
 	mux.HandleFunc("/health", s.handleHealth)
@@ -137,53 +144,35 @@ func (s *server) runSearch(req SearchRequest) (*SearchResponse, int, error) {
 		safeFlags = append(safeFlags, f)
 	}
 
-	// Resolve search targets from the file pattern.
-	// Prevent path traversal by stripping any directory separators from the pattern.
-	filePattern := req.FilePattern
-	if filePattern == "" {
-		filePattern = "*"
-	}
-
-	if strings.HasPrefix(filePattern, "..") || strings.HasPrefix(filePattern, "/") {
-		return nil, http.StatusBadRequest, errors.New("invalid file pattern: cannot start with '..' or '/'")
-	}
-
-	// Resolve absolute path and ensure it's within logDir.
-	fullPath := filepath.Join(s.logDir, filePattern)
-	cleanPath := filepath.Clean(fullPath)
-
-	absLogDir, err := filepath.Abs(s.logDir)
-	if err != nil {
-		return nil, http.StatusInternalServerError, fmt.Errorf("failed to get absolute log directory: %v", err)
-	}
-	absCleanPath, err := filepath.Abs(cleanPath)
-	if err != nil {
-		return nil, http.StatusInternalServerError, fmt.Errorf("failed to get absolute search path: %v", err)
-	}
-
-	if !strings.HasPrefix(absCleanPath, absLogDir) {
-		return nil, http.StatusBadRequest, errors.New("invalid file pattern: outside of log directory")
-	}
-
+	// Determine search targets.
 	var searchTargets []string
-	if filePattern == "*" {
-		// Search the whole log directory recursively.
-		searchTargets = []string{s.logDir}
-	} else {
-		matches, err := filepath.Glob(cleanPath)
-		if err != nil {
-			return nil, http.StatusBadRequest, fmt.Errorf("invalid file pattern: %v", err)
+	if req.TimeRange != "" {
+		if s.logNameFormat == "" {
+			return nil, http.StatusBadRequest, errors.New("time_range search requires the --log-name-format server flag to be set")
 		}
-		if len(matches) == 0 {
-			// No files matched – return an empty result immediately.
+		duration, err := parseDuration(req.TimeRange)
+		if err != nil {
+			return nil, http.StatusBadRequest, fmt.Errorf("invalid time_range: %v", err)
+		}
+		searchTargets, err = generateFilePaths(s.logDir, s.logNameFormat, duration)
+		if err != nil {
+			return nil, http.StatusInternalServerError, fmt.Errorf("could not generate file paths for time range: %v", err)
+		}
+		if len(searchTargets) == 0 {
+			// No files matched the time range, return empty result.
 			return &SearchResponse{Lines: []string{}, Count: 0, Command: ""}, http.StatusOK, nil
 		}
-		searchTargets = matches
+	} else {
+		// Default to searching the whole log directory recursively.
+		searchTargets = []string{s.logDir}
 	}
 
 	// Build the argument list.
 	// We use -r (recursive) so that the log directory can contain sub-directories.
 	args := []string{"-r"}
+	if req.MaxLines > 0 {
+		args = append(args, "-m", fmt.Sprintf("%d", req.MaxLines))
+	}
 	args = append(args, safeFlags...)
 	// Pass keyword and paths as separate arguments to avoid shell injection.
 	args = append(args, "--")
@@ -231,6 +220,72 @@ func (s *server) runSearch(req SearchRequest) (*SearchResponse, int, error) {
 	}, http.StatusOK, nil
 }
 
+// parseDuration converts a string like "1d", "2h", "30m" into a time.Duration.
+// It extends time.ParseDuration by supporting "d" for days.
+func parseDuration(s string) (time.Duration, error) {
+	if strings.HasSuffix(s, "d") {
+		daysStr := strings.TrimSuffix(s, "d")
+		days, err := time.ParseDuration(fmt.Sprintf("%sh", daysStr))
+		if err != nil {
+			return 0, err
+		}
+		return days * 24, nil
+	}
+	return time.ParseDuration(s)
+}
+
+// generateFilePaths creates a list of file paths based on a log name format and time duration.
+// It works back from the current time.
+func generateFilePaths(logDir, format string, duration time.Duration) ([]string, error) {
+	// 1. Convert our format to Go's layout string.
+	layout := strings.NewReplacer("%Y", "2006", "%m", "01", "%d", "02", "%H", "15").Replace(format)
+
+	// 2. Determine the granularity of the format (daily or hourly).
+	var step time.Duration
+	if strings.Contains(format, "%H") {
+		step = time.Hour
+	} else {
+		step = 24 * time.Hour
+	}
+
+	// 3. Iterate from now back to the start time, generating file names.
+	pathSet := make(map[string]struct{})
+	now := time.Now()
+	startTime := now.Add(-duration)
+
+	for t := now; t.After(startTime) || t.Equal(startTime); t = t.Add(-step) {
+		// Format the time according to the layout to get the file name.
+		fileName := t.Format(layout)
+		fullPath := filepath.Join(logDir, fileName)
+
+		// Ensure the generated path is clean and within the log directory.
+		cleanPath := filepath.Clean(fullPath)
+		absLogDir, err := filepath.Abs(logDir)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get absolute log directory: %v", err)
+		}
+		absCleanPath, err := filepath.Abs(cleanPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get absolute search path: %v", err)
+		}
+		if !strings.HasPrefix(absCleanPath, absLogDir) {
+			// This should theoretically not happen if we build paths correctly, but as a safeguard.
+			continue
+		}
+
+		pathSet[cleanPath] = struct{}{}
+	}
+
+	// Convert the set to a slice.
+	paths := make([]string, 0, len(pathSet))
+	for p := range pathSet {
+		paths = append(paths, p)
+	}
+
+	return paths, nil
+}
+
+
 func writeError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -240,6 +295,7 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 func main() {
 	logDir := flag.String("log-dir", "", "path to the log directory to search (required)")
 	addr := flag.String("addr", ":9999", "address to listen on (default :9999)")
+	logNameFormat := flag.String("log-name-format", "", "log file name format for time-based search (e.g. 'app-%Y-%m-%d.log')")
 	flag.Parse()
 
 	if *logDir == "" {
@@ -259,7 +315,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	s := newServer(*logDir)
+	s := newServer(*logDir, *logNameFormat)
 
 	httpServer := &http.Server{
 		Addr:         *addr,
@@ -274,7 +330,7 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("log-tools server listening on %s (log dir: %s)", *addr, *logDir)
+		log.Printf("log-tools server listening on %s (log dir: %s, name format: %q)", *addr, *logDir, *logNameFormat)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("server error: %v", err)
 		}
